@@ -1,0 +1,125 @@
+WORKSPACE_PATH = 'Tensorflow/workspace'
+SCRIPTS_PATH = 'Tensorflow/scripts'
+APIMODEL_PATH = 'Tensorflow/models'
+ANNOTATION_PATH = WORKSPACE_PATH+'/annotations'
+IMAGE_PATH = WORKSPACE_PATH+'/images'
+MODEL_PATH = WORKSPACE_PATH+'/models'
+PRETRAINED_MODEL_PATH = WORKSPACE_PATH+'/pre-trained-models'
+CONFIG_PATH = MODEL_PATH+'/my_faster/pipeline.config'
+CHECKPOINT_PATH = MODEL_PATH+'/my_faster/'
+labels = [{'name':'temple', 'id':1}, {'name':'notemple', 'id':2}]
+
+with open(ANNOTATION_PATH + '\label_map.pbtxt', 'w') as f:
+    for label in labels:
+        f.write('item { \n')
+        f.write('\tname:\'{}\'\n'.format(label['name']))
+        f.write('\tid:{}\n'.format(label['id']))
+        f.write('}\n')
+!python {SCRIPTS_PATH + '/generate_tfrecord.py'} -x {IMAGE_PATH + '/train'} -l {ANNOTATION_PATH + '/label_map.pbtxt'} -o {ANNOTATION_PATH + '/train.record'}
+!python {SCRIPTS_PATH + '/generate_tfrecord.py'} -x{IMAGE_PATH + '/test'} -l {ANNOTATION_PATH + '/label_map.pbtxt'} -o {ANNOTATION_PATH + '/test.record'}
+!cd Tensorflow && git clone https://github.com/tensorflow/models
+CUSTOM_MODEL_NAME = 'my_faster'
+!mkdir {'Tensorflow\workspace\models\\'+CUSTOM_MODEL_NAME}
+!cp {PRETRAINED_MODEL_PATH+'/faster_rcnn_inception_resnet_v2_1024x1024_coco17_tpu-8/pipeline.config'} {MODEL_PATH+'/'+CUSTOM_MODEL_NAME}
+import tensorflow as tf
+from object_detection.utils import config_util
+from object_detection.protos import pipeline_pb2
+from google.protobuf import text_format
+CONFIG_PATH = MODEL_PATH+'/'+CUSTOM_MODEL_NAME+'/pipeline.config'
+config = config_util.get_configs_from_pipeline_file(CONFIG_PATH)
+pipeline_config = pipeline_pb2.TrainEvalPipelineConfig()
+with tf.io.gfile.GFile(CONFIG_PATH, "r") as f:                                                                                                                                                                                                                     
+    proto_str = f.read()                                                                                                                                                                                                                                          
+    text_format.Merge(proto_str, pipeline_config)  
+pipeline_config.model.faster_rcnn.num_classes = 2
+pipeline_config.train_config.batch_size = 4
+pipeline_config.train_config.fine_tune_checkpoint = PRETRAINED_MODEL_PATH+'/faster_rcnn_inception_resnet_v2_1024x1024_coco17_tpu-8/checkpoint/ckpt-0'
+pipeline_config.train_config.fine_tune_checkpoint_type = "detection"
+pipeline_config.train_input_reader.label_map_path= ANNOTATION_PATH + '/label_map.pbtxt'
+pipeline_config.train_input_reader.tf_record_input_reader.input_path[:] = [ANNOTATION_PATH + '/train.record']
+pipeline_config.eval_input_reader[0].label_map_path = ANNOTATION_PATH + '/label_map.pbtxt'
+pipeline_config.eval_input_reader[0].tf_record_input_reader.input_path[:] = [ANNOTATION_PATH + '/test.record']
+pipeline_config.model.faster_rcnn.image_resizer.keep_aspect_ratio_resizer.min_dimension = 240
+pipeline_config.model.faster_rcnn.image_resizer.keep_aspect_ratio_resizer.max_dimension = 240
+config_text = text_format.MessageToString(pipeline_config)                                                                                                                                                                                                        
+with tf.io.gfile.GFile(CONFIG_PATH, "wb") as f:                                                                                                                                                                                                                     
+    f.write(config_text)  
+print("""python {}/research/object_detection/model_main_tf2.py --model_dir={}/{} --pipeline_config_path={}/{}/pipeline.config
+--num_train_steps=1000""".format(APIMODEL_PATH, MODEL_PATH,CUSTOM_MODEL_NAME,MODEL_PATH,CUSTOM_MODEL_NAME))
+print("""python {}/research/object_detection/model_main_tf2.py --model_dir={}/{} --pipeline_config_path={}/{}/pipeline.config --checkpoint_dir={}/{}""".format(APIMODEL_PATH, MODEL_PATH, CUSTOM_MODEL_NAME, MODEL_PATH, CUSTOM_MODEL_NAME, MODEL_PATH, CUSTOM_MODEL_NAME))
+import os
+from object_detection.utils import label_map_util
+from object_detection.utils import visualization_utils as viz_utils
+from object_detection.builders import model_builder
+# Load pipeline config and build a detection model
+configs = config_util.get_configs_from_pipeline_file(CONFIG_PATH)
+detection_model = model_builder.build(model_config=configs['model'], is_training=False)
+# Restore checkpoint
+ckpt = tf.compat.v2.train.Checkpoint(model=detection_model)
+ckpt.restore(os.path.join(CHECKPOINT_PATH, 'ckpt-6')).expect_partial()
+@tf.function
+def detect_fn(image):
+    image, shapes = detection_model.preprocess(image)
+    prediction_dict = detection_model.predict(image, shapes)
+    detections = detection_model.postprocess(prediction_dict, shapes)
+    return detections
+import numpy as np
+import os
+import six.moves.urllib as urllib
+import sys
+import tarfile
+import tensorflow as tf
+import zipfile
+from collections import defaultdict
+from io import StringIO
+from matplotlib import pyplot as plt
+from PIL import Image
+from IPython.display import display
+def run_inference_for_single_image(model, image):
+  image_np = np.array(image)
+  # The input needs to be a tensor, convert it using `tf.convert_to_tensor`.
+  input_tensor = tf.convert_to_tensor(np.expand_dims(image_np, 0), dtype=tf.float32)
+  # The model expects a batch of images, so add an axis with `tf.newaxis`.
+  input_tensor = input_tensor[tf.newaxis,...]
+  # Run inference
+  model_fn = model.signatures['serving_default']
+  detections = detect_fn(input_tensor)
+  # All outputs are batches tensors.
+  # Convert to numpy arrays, and take index [0] to remove the batch dimension.
+  # We're only interested in the first num_detections.
+  num_detections = int(output_dict.pop('num_detections'))
+  output_dict = {key:value[0, :num_detections].numpy() 
+                 for key,value in output_dict.items()}
+  output_dict['num_detections'] = num_detections
+  # detection_classes should be ints.
+  output_dict['detection_classes'] = output_dict['detection_classes'].astype(np.int64)
+  # Handle models with masks:
+  if 'detection_masks' in output_dict:
+    # Reframe the the bbox mask to the image size.
+
+    detection_masks_reframed = utils_ops.reframe_box_masks_to_image_masks(
+              output_dict['detection_masks'], output_dict['detection_boxes'],
+               image.shape[0], image.shape[1])      
+    detection_masks_reframed = tf.cast(detection_masks_reframed > 0.5,
+                                       tf.uint8)
+    output_dict['detection_masks_reframed'] = detection_masks_reframed.numpy()
+  return output_dict
+def show_inference(model, image_path):
+  # the array based representation of the image will be used later in order to prepare the
+  # result image with boxes and labels on it.
+  image_np = np.array(Image.open(image_path))
+  # Actual detection.
+  output_dict = run_inference_for_single_image(model, image_np)
+  # Visualization of the results of a detection.
+  vis_util.visualize_boxes_and_labels_on_image_array(
+      image_np,
+      output_dict['detection_boxes'],
+      output_dict['detection_classes'],
+      output_dict['detection_scores'],
+      category_index,
+      instance_masks=output_dict.get('detection_masks_reframed', None),
+      use_normalized_coordinates=True,
+      line_thickness=8)
+  display(Image.fromarray(image_np))
+for image_path in TEST_IMAGE_PATHS:
+  show_inference(detection_model, image_path)
